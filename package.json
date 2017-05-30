@@ -1,0 +1,16 @@
+{
+  "name": "devtools-gdb",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies" : {
+  	"gdb-js" : "latest",
+  	"babel-polyfill": "latest",
+  	"ws": "latest"
+  },
+  "author": "ak239spb@gmail.com",
+  "license": "ISC"
+}
