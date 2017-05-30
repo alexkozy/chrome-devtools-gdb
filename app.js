@@ -1,6 +1,6 @@
 require('babel-polyfill');
 
-// chrome-devtools://devtools/bundled/inspector.html?experiments=true&v8only=true&ws=127.0.0.1:8081
+console.log('To start debugging, open the following URL in Chrome:\nchrome-devtools://devtools/bundled/inspector.html?experiments=true&v8only=true&ws=127.0.0.1:8081');
 
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -61,6 +61,123 @@ class FrontendChanelImpl {
     this._ws.send(JSON.stringify({method, params}))
   }
 }
+
+class RemoteObject {
+  constructor(gdb, gdbValue) {
+    this._gdb = gdb;
+    this._name = gdbValue.name;
+    this._numchild = gdbValue.numchild;
+    this._value = gdbValue.value;
+    this._type = gdbValue.type;
+    this._thread_id = gdbValue.thread_id;
+  }
+
+  id() {
+    return this._name;
+  }
+
+  static async create(gdb, expression) {
+    try {
+      expression = expression.replace(/\s/g,'');
+      let obj = await gdb.execMI(`-var-create - * ${expression}`);
+      let m = !obj.type.startsWith('char') && !obj.type.startsWith('const char') ? obj.type.match(/([*]+)/) : obj.type.match(/[*]([*]+)/);
+      if (m && m.length > 1 && m[1].length) {
+        gdb.execMI('-var-delete ' + obj._name);
+        obj = await gdb.execMI(`-var-create - * ${m[1]}(${expression})`);
+      }
+      return new RemoteObject(gdb, obj);
+    } catch (e) {
+      console.log(e.stack);
+      return new RemoteObject();
+    }
+  }
+
+  toProtocolValue() {
+    let type = this._type || '';
+    type = type.replace(/^(const\s+)+/, '');
+    if (type === 'int') return {type: 'number', value: this._value};
+    if (type === 'long') return {type: 'number', value: this._value};
+    if (type === 'size_t') return {type: 'number', value: this._value};
+    if (type === 'double') return {type: 'number', value: this._value};
+    if (type === 'float') return {type: 'number', value: this._value};
+    if (type === 'bool') return {type: 'number', value: this._value === 'true'};
+    if (type === 'char *') {
+      let value = this._value;
+      let firstSpace = value.indexOf(' ');
+      return {type: 'string', value: this._value.substr(firstSpace + 1).slice(1, -1)};
+    }
+    if (type === 'char') return {type: 'string', value: this._value.split(' ', 2)[1].slice(1, -1)};
+    return {type: 'object', className: this._type, description: (this._type || '') + (this._value || ''), objectId: this._name};
+  }
+
+  async getProperties(runtimeAgent) {
+    if (!this._numchild) return [];
+    try {
+      let {children} = await this._gdb.execMI('-var-list-children --all-values ' + this._name);
+      let wrappedChildren = children.map(child => new RemoteObject(this._gdb, child.value));
+      wrappedChildren.forEach(child => runtimeAgent.register(child));
+      let props = [];
+      for (let i = 0; i < children.length; ++i) {
+        props.push({name: children[i].value.exp, value: wrappedChildren[i].toProtocolValue()});
+      }
+      return props;
+    } catch (e) {
+      console.log(e.stack);
+    }
+    return [];
+  }
+
+  dispose() {
+    if (this._name) {
+      this._gdb.execMI('-var-delete ' + this._name);
+    }
+  }
+};
+
+class CurrentScopeObject {
+  constructor(gdb, locals) {
+    this._gdb = gdb;
+    this._name = 'currentScope';
+    this._numchild = locals.length;
+    this._locals = locals;
+  }
+
+  id() {
+    return this._name;
+  }
+
+  static async create(gdb) {
+    try {
+      let {locals} = await gdb.execMI('-stack-list-locals --all-values');
+      return new CurrentScopeObject(gdb, locals);
+    } catch (e) {
+      console.log(e.stack);
+      return new RemoteObject();
+    }
+  }
+
+  toProtocolValue() {
+    return {type: 'object', objectId: this._name};
+  }
+
+  async getProperties(runtimeAgent) {
+    try {
+      let props = [];
+      for (let local of this._locals) {
+        let wrapped = await RemoteObject.create(this._gdb, local.name);
+        runtimeAgent.register(wrapped);
+        props.push({name: local.name, value: wrapped.toProtocolValue()});
+      }
+      return props;
+    } catch (e) {
+      console.log(e.stack);
+    }
+    return [];
+  }
+
+  dispose() {
+  }
+};
 
 class DebuggerImpl {
   constructor(chanel, gdb, runtime) {
@@ -160,8 +277,20 @@ class DebuggerImpl {
   }
 
   async evaluateOnCallFrame(params) {
-    // let variable = await this._gdb.execMI(`-var-create - * ${params.expression}`);
-    // console.log(variable);
+    let obj = await RemoteObject.create(this._gdb, params.expression);
+    console.log(obj);
+    // obj.dispose();
+    let value = obj.toProtocolValue();
+    this._runtime.register(obj);
+    if (value) {
+      console.log(value);
+      return {result: value};
+    }
+    let expression = params.expression;
+    if (expression.startsWith('.mi')) {
+      let result = await this._gdb.execMI(expression.substr(3));
+      return {result:{type: 'string', value: result}};
+    }
     let r = await this._gdb.evaluate(params.expression);
     console.log(r);
     return { result: {type: "string", value: r }};
@@ -183,29 +312,13 @@ class DebuggerImpl {
       return;
     }
     let frames = await this._gdb.callstack();
-    let id = 0;
-    let {locals} = await this._gdb.execMI('-stack-list-locals --all-values');
-    let hm = {};
-    for (var local of locals) {
-      let variable = await this._gdb.execMI(`-var-create - * ${local.name}`);
-      console.log(variable);
-      let name = variable.name;
-      console.log(await this._gdb.execMI(`-var-list-children ${name}`));
-      let coolName = (await this._gdb.execMI(`-var-info-expression ${name}`)).exp;
-      if (variable.numchild * 1 === 0) {
-        // highlight based on types
-        if (variable.type === 'int')
-          hm[coolName] = variable.value;
-        else
-          hm[coolName] = variable.value;
-      } else {
-        hm[coolName] = variable.value;
-      }
-    }
+    let scopes = await CurrentScopeObject.create(this._gdb);
+    this._runtime.register(scopes);
     let wrapperLocals = [{
       type: 'local',
-      object: this._runtime.wrapValue(hm),
+      object: scopes.toProtocolValue(),
     }];
+    let id = 0;
     let callFrames = frames.filter(frame => this._revSourcesMap.has(frame.file)).map(frame => ({
       callFrameId: ++id + '',
       functionName: frame.functionName,
@@ -241,7 +354,7 @@ class RuntimeImpl {
     this._gdb = gdb;
 
     this._lastObjectId = 0;
-    this._wrappedObjects = new Map();
+    this._debugObjects = new Map();
 
     this._chanel.sendNotification('Runtime.executionContextCreated', {
       context: {
@@ -272,41 +385,13 @@ class RuntimeImpl {
   }
 
   async getProperties(params) {
-    if (!this._wrappedObjects.has(params.objectId * 1)) throw new Error('Object not found');
-    let obj = this._wrappedObjects.get(params.objectId * 1);
-    let props = [];
-    for (let v in obj) {
-      props.push({name: v, value: this.wrapValue(obj[v])});
-    }
-    return {result: props};
+    let objectId = params.objectId;
+    if (!this._debugObjects.has(objectId)) throw new Error('Object not found');
+    return {result: await this._debugObjects.get(objectId).getProperties(this)};
   }
 
-  wrapValue(value) {
-    let res = {};
-    res.type = typeof value;
-    if (res.type === 'undefined' || res.type === 'boolean' || res.type === 'number' || res.type === 'string') {
-      if (res.type !== 'undefined') {
-        res.value = value;
-      }
-      if (value === null) res.substype = 'null';
-      if (res.type === "number") {
-          res.description = toStringDescription(res);
-          switch (res.description) {
-          case "NaN":
-          case "Infinity":
-          case "-Infinity":
-          case "-0":
-              delete res.value;
-              res.unserializableValue = res.description;
-              break;
-          }
-      }
-      return res;
-    }
-    let id = ++this._lastObjectId;
-    this._wrappedObjects.set(id, value);
-    res.objectId = id + '';
-    return res;
+  register(value) {
+    this._debugObjects.set(value.id(), value);
   }
 };
 
