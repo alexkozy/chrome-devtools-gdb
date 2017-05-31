@@ -7,9 +7,10 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies" : {
-  	"gdb-js" : "latest",
-  	"babel-polyfill": "latest",
-  	"ws": "latest"
+    "gdb-js" : "latest",
+    "babel-polyfill": "latest",
+    "ws": "latest",
+    "command-line-args": "latest"
   },
   "author": "ak239spb@gmail.com",
   "license": "ISC"

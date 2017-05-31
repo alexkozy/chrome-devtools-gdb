@@ -8,21 +8,23 @@ const { sep } = require('path');
 const spawn = require('child_process').spawn;
 const GDB = require('gdb-js').GDB;
 
+const commandLineArgs = require('command-line-args');
+const optionDefinitions = [
+  { name: 'gdbargs', type: String, multiple: true },
+  { name: 'src', type: String, multiple: true }
+];
+const options = commandLineArgs(optionDefinitions);
 const wss = new WebSocket.Server({ port: 8081 });
 
 wss.on('connection', function connection(ws) {
   let child = spawn('gdb', [
     '-i=mi',
-    '--args',
-    '/usr/local/google/home/kozyatinskiy/v8/v8/out.gn/x64.debug/inspector-test',
-    '/usr/local/google/home/kozyatinskiy/v8/v8/test/inspector/protocol-test.js',
-    '/usr/local/google/home/kozyatinskiy/v8/v8/test/inspector/debugger/evaluate-on-call-frame-in-module.js'
-  ]);
+    '--args' ].concat(options.gdbargs));
   let gdb = new GDB(child);
 
   let chanel = new FrontendChanelImpl(ws);
   let Runtime = new RuntimeImpl(chanel, gdb);
-  let Debugger = new DebuggerImpl(chanel, gdb, Runtime);
+  let Debugger = new DebuggerImpl(chanel, gdb, Runtime, options.src);
   let Profiler = new ProfilerImpl(chanel);
 
   ws.on('message', function incoming(message) {
@@ -87,6 +89,7 @@ class RemoteObject {
       }
       return new RemoteObject(gdb, obj);
     } catch (e) {
+      // return errors as exceptions
       console.log(e.stack);
       return new RemoteObject();
     }
@@ -180,13 +183,13 @@ class CurrentScopeObject {
 };
 
 class DebuggerImpl {
-  constructor(chanel, gdb, runtime) {
+  constructor(chanel, gdb, runtime, src) {
     this._enabled = false;
     this._chanel = chanel;
     this._gdb = gdb;
     this._runtime = runtime;
 
-    this._sources = new Sources(['/usr/local/google/home/kozyatinskiy/v8/v8/src', '/usr/local/google/home/kozyatinskiy/v8/v8/test/inspector']);
+    this._sources = new Sources(src);
     this._sourcesMap = new Map();
     this._revSourcesMap = new Map();
     this._lastSourceId = 0;
@@ -278,22 +281,10 @@ class DebuggerImpl {
 
   async evaluateOnCallFrame(params) {
     let obj = await RemoteObject.create(this._gdb, params.expression);
-    console.log(obj);
-    // obj.dispose();
     let value = obj.toProtocolValue();
-    this._runtime.register(obj);
-    if (value) {
-      console.log(value);
-      return {result: value};
-    }
-    let expression = params.expression;
-    if (expression.startsWith('.mi')) {
-      let result = await this._gdb.execMI(expression.substr(3));
-      return {result:{type: 'string', value: result}};
-    }
-    let r = await this._gdb.evaluate(params.expression);
-    console.log(r);
-    return { result: {type: "string", value: r }};
+    this._runtime.register(obj, params.groupName || '');
+    if (!value) throw new Error("Error during evaluation.");
+    return {result: value};
   }
 
   async _currentThreadId() {
@@ -363,6 +354,8 @@ class RuntimeImpl {
         name: 'default'
       }
     });
+
+    this._objectGroupSymbol = Symbol('objectGroup');
   }
 
   async enable(params) {
@@ -390,8 +383,25 @@ class RuntimeImpl {
     return {result: await this._debugObjects.get(objectId).getProperties(this)};
   }
 
-  register(value) {
+  async releaseObjectGroup(params) {
+    let data = new Map();
+    for (var pair of this._debugObjects) {
+      if (pair[1][this._objectGroupSymbol] !== params.objectGroup) {
+        data.set(pair[0], pair[1]);
+      }
+    }
+    this._debugObjects = data;
+  }
+
+  async releaseObject(params) {
+    this._debugObjects.delete(params.objectId);
+  }
+
+  register(value, groupName) {
     this._debugObjects.set(value.id(), value);
+    if (groupName) {
+      value[this._objectGroupSymbol] = groupName;
+    }
   }
 };
 
